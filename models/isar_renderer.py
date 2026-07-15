@@ -319,16 +319,43 @@ class ISARRenderer:
         n_samples = range_vals.shape[0]
         points = ray_bases[:, None, :] + range_vals[None, :, None] * ray_dir[None, None, :]
         points_flat = points.reshape(-1, 3)
+        points_flat.requires_grad_(True)
         density, intensity, field_aux = nerf_network.density_intensity(
             points_flat,
-            use_learned_intensity=use_learned_intensity,
+            use_learned_intensity=False,
             return_aux=True
         )
+
+        surface_sdf = field_aux.get('surface_sdf')
+        if surface_sdf is None:
+            raise RuntimeError(
+                'Incidence-angle backscatter requires NeRF density_mode=ellipsoid_sdf_residual'
+            )
+        gradients = torch.autograd.grad(
+            outputs=surface_sdf,
+            inputs=points_flat,
+            grad_outputs=torch.ones_like(surface_sdf),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        normals = F.normalize(gradients, dim=-1).reshape(n_rays, n_samples, 3)
+        los = _meta_vector(frame_meta, 'radar_los').to(
+            device=points_flat.device,
+            dtype=points_flat.dtype
+        )
+        los = F.normalize(los, dim=0)
+        incidence_cos = torch.clamp(
+            torch.sum(normals * los[None, None, :], dim=-1, keepdim=True),
+            min=0.0
+        )
+        scatter = incidence_cos ** 2
+
         density = density.reshape(n_rays, n_samples, 1)
         intensity = intensity.reshape(n_rays, n_samples, 1)
         dists = self.compute_range_dists(range_vals[None, :].expand(n_rays, -1))
         alpha, weights = self.compute_nerf_weights(density, dists)
-        point_weight = weights * intensity * ray_area
+        point_weight = weights * scatter * ray_area
 
         range_bin, azimuth_bin, range_coord, azimuth_coord = self.project_points(points_flat, frame_meta)
         point_weight_flat = point_weight.reshape(-1)
@@ -343,8 +370,11 @@ class ISARRenderer:
             'image': image,
             'density': density.reshape(-1, 1),
             'intensity': intensity.reshape(-1, 1),
-            'surface_sdf': field_aux.get('surface_sdf'),
+            'surface_sdf': surface_sdf,
             'sdf_residual': field_aux.get('sdf_residual'),
+            'gradients': gradients,
+            'normals': normals.reshape(-1, 3),
+            'scatter': scatter.reshape(-1, 1),
             'points': points_flat,
             'point_weight': point_weight.reshape(-1, 1),
             'range_bin': range_bin,
