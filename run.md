@@ -1,47 +1,52 @@
-# ISAR 训练/验证运行命令
+# NeRF-main 运行命令速查
 
-以下命令默认在项目根目录运行：
+默认已经进入正确 conda 环境，并在项目根目录运行：
 
-```powershell
-cd D:\A_master\AAA组会\AAAA研究方向\NeuS-main
+```bash
+cd /home/lpy/AICode/XZC/Nerf-main
 ```
 
-Python 环境：
+Windows 同理，先进入项目目录：
 
 ```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe
+cd D:\A_master\AAA组会\AAAA研究方向\网络重建\Nerf-main
 ```
 
-默认目标：`1999JV6`  
-默认配置：`confs/isar_fuyan.conf`
+如果环境已经激活，命令里可以直接用：
+
+```bash
+python isar_runner.py ...
+```
+
+如果没有激活环境，就把 `python` 换成完整解释器路径，例如：
+
+```bash
+/home/lpy/.conda/envs/neus_py38/bin/python isar_runner.py ...
+```
+
+```powershell
+D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py ...
+```
+
+默认配置文件：`./confs/isar_fuyan.conf`  
+默认目标：`1999JV6`
 
 ---
 
-## 1. 从头开始训练
+## 1. 从头训练
 
-确认配置里：
-
-```hocon
-train {
-    end_iter = 1000
-    save_freq = 200
-}
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode train --case 1999JV6
 ```
 
-然后运行：
+从头训练不要加 `--is_continue`，也不要加 `--checkpoint`。
 
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode train --case 1999JV6
-```
-
-从头训练时不要加 `--is_continue`，也不要加 `--checkpoint`。
-
-训练过程中会按配置保存：
+输出主要在：
 
 ```text
 exp/1999JV6/checkpoints/ckpt_XXXXXX.pth
 exp/1999JV6/validations/iter_XXXXXX_frames_*.png
-exp/1999JV6/sdf_z_planes/sdf_z0_XXXXXX.png
+exp/1999JV6/density_z_planes/density_z0_XXXXXX.png
 exp/1999JV6/meshes/mesh_XXXXXX.ply
 exp/1999JV6/logs/train_metrics.csv
 exp/1999JV6/logs/loss_curves.png
@@ -49,143 +54,77 @@ exp/1999JV6/logs/loss_curves.png
 
 ---
 
-## 2. 从断点继续训练
+## 2. 继续训练
 
-### 2.1 自动读取最新断点
+自动读取最新 checkpoint：
 
-程序会自动读取：
-
-```text
-exp/1999JV6/checkpoints/
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode train --case 1999JV6 --is_continue
 ```
 
-里满足 `iter <= train.end_iter` 的最新 checkpoint。
+读取指定 checkpoint：
 
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode train --case 1999JV6 --is_continue
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode train --case 1999JV6 --checkpoint ckpt_020000.pth
 ```
 
-注意：如果你想从 `ckpt_000800.pth` 继续，配置里的：
+也可以给完整路径：
 
-```hocon
-train.end_iter
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode train --case 1999JV6 --checkpoint /home/lpy/AICode/XZC/Nerf-main/exp/1999JV6/checkpoints/ckpt_020000.pth
 ```
 
-必须大于等于 `800`，否则自动读取最新断点时它会被跳过。
-
-### 2.2 读取指定断点继续训练
-
-指定 checkpoint 文件名：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode train --case 1999JV6 --checkpoint ckpt_000400.pth
-```
-
-也可以指定完整路径：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode train --case 1999JV6 --checkpoint D:\A_master\AAA组会\AAAA研究方向\NeuS-main\exp\1999JV6\checkpoints\ckpt_000400.pth
-```
-
-指定 `--checkpoint` 后，不需要再加 `--is_continue`。如果两者都加，优先使用 `--checkpoint` 指定的断点。
-
-注意：继续训练时 `train.end_iter` 要大于 checkpoint 里的 `iter_step`。例如读取 `ckpt_000400.pth` 后，`end_iter` 必须大于 `400`，否则程序会认为已经训练结束，只保存 final 结果。
+注意：继续训练时，`train.end_iter` 必须大于 checkpoint 里的 `iter_step`。
 
 ---
 
-## 3. 读取断点，只验证图像
+## 3. 验证图像
 
-不训练，只加载 checkpoint 并输出验证拼接图。
+自动读取最新 checkpoint，验证所有视角：
 
-### 3.1 自动读取最新断点，验证所有图像
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_views --case 1999JV6 --is_continue --view_ids all
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode validate_views --case 1999JV6 --is_continue --view_ids all
 ```
 
-输出位置类似：
+只验证指定视角：
+
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode validate_views --case 1999JV6 --is_continue --view_ids 0,6,12
+```
+
+读取指定 checkpoint 验证：
+
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode validate_views --case 1999JV6 --checkpoint ckpt_020000.pth --view_ids all
+```
+
+输出位置：
 
 ```text
 exp/1999JV6/validations/iter_XXXXXX_frames_all.png
-```
-
-### 3.2 自动读取最新断点，验证指定图像
-
-只看第 0 帧：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_views --case 1999JV6 --is_continue --view_ids 0
-```
-
-看多帧：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_views --case 1999JV6 --is_continue --view_ids 0,6,12
-```
-
-输出位置类似：
-
-```text
-exp/1999JV6/validations/iter_XXXXXX_frames_0.png
 exp/1999JV6/validations/iter_XXXXXX_frames_0_6_12.png
-```
-
-### 3.3 读取指定断点，只验证图像
-
-指定断点并验证全部图像：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_views --case 1999JV6 --checkpoint ckpt_000400.pth --view_ids all
-```
-
-指定断点并验证部分图像：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_views --case 1999JV6 --checkpoint ckpt_000400.pth --view_ids 0,6,12
-```
-
-也可以在配置里设置默认验证视角：
-
-```hocon
-validate {
-    view_ids = "all"      # all 或 0 或 0,6,12
-}
-```
-
-然后运行：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_views --case 1999JV6 --is_continue
 ```
 
 ---
 
-## 4. 读取断点，只导出 mesh
+## 4. 导出 Mesh
 
-### 4.1 自动读取最新断点导出 mesh
+自动读取最新 checkpoint：
 
-使用配置里的 `validate.mesh_resolution`：
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_mesh --case 1999JV6 --is_continue
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode validate_mesh --case 1999JV6 --is_continue
 ```
 
-临时覆盖 mesh 分辨率，例如 `128`：
+指定 checkpoint：
 
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_mesh --case 1999JV6 --is_continue --mesh_resolution 128
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode validate_mesh --case 1999JV6 --checkpoint ckpt_020000.pth
 ```
 
-临时覆盖 marching cubes 阈值：
+临时指定分辨率和阈值：
 
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_mesh --case 1999JV6 --is_continue --mcube_threshold 0.0
-```
-
-### 4.2 读取指定断点导出 mesh
-
-```powershell
-D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fuyan.conf --mode validate_mesh --case 1999JV6 --checkpoint ckpt_000400.pth --mesh_resolution 128
+```bash
+python isar_runner.py --conf ./confs/isar_fuyan.conf --mode validate_mesh --case 1999JV6 --checkpoint ckpt_020000.pth --mesh_resolution 128 --mcube_threshold 0.03
 ```
 
 输出位置：
@@ -194,76 +133,87 @@ D:\Anaconda3\anaconda\envs\neus\python.exe isar_runner.py --conf .\confs\isar_fu
 exp/1999JV6/meshes/mesh_XXXXXX.ply
 ```
 
----
-
-## 5. 训练结束或 Ctrl+C 打断时自动保存最后结果
-
-当前配置支持训练正常结束或手动 `Ctrl+C` 打断时保存最后结果：
-
-```hocon
-validate {
-    export_final_checkpoint = true
-    export_final_image = true
-    export_final_sdf = true
-    export_final_mesh = true
-    final_view_ids = "all"
-}
-```
-
-会保存：
+NeRF 当前 mesh 阈值是相对阈值：
 
 ```text
-exp/1999JV6/checkpoints/ckpt_XXXXXX.pth
-exp/1999JV6/validations/iter_XXXXXX_frames_all.png
-exp/1999JV6/sdf_z_planes/sdf_z0_XXXXXX.png
-exp/1999JV6/meshes/mesh_XXXXXX.ply
-exp/1999JV6/logs/loss_curves.png
+value = min(alpha * mean_LOS(sigma)) + (max - min) * threshold_ratio
 ```
 
-注意：这个功能只对重新启动后的训练进程生效。已经在旧代码下启动的训练，不会自动执行新的收尾逻辑。
+注意：当前代码里 `--mcube_threshold 0.0` 表示使用配置文件默认值，不一定是真 0。想接近 0 时用：
+
+```bash
+--mcube_threshold 0.001
+```
+
+---
+
+## 5. 扫一组 Mesh 阈值
+
+Linux：
+
+```bash
+cd /home/lpy/AICode/XZC/Nerf-main
+
+CKPT=ckpt_020000.pth
+
+for t in 0.001 0.01 0.03 0.05 0.10 0.20 0.30 0.40; do
+    python isar_runner.py \
+        --conf ./confs/isar_fuyan.conf \
+        --mode validate_mesh \
+        --case 1999JV6 \
+        --checkpoint $CKPT \
+        --mesh_resolution 128 \
+        --mcube_threshold $t
+
+    tag=$(printf "%04d" $(python -c "print(int(float('$t') * 1000))"))
+    cp ./exp/1999JV6/meshes/mesh_020000.ply ./exp/1999JV6/meshes/mesh_020000_thr${tag}.ply
+done
+```
+
+Windows PowerShell：
+
+```powershell
+cd D:\A_master\AAA组会\AAAA研究方向\网络重建\Nerf-main
+
+$ckpt = "ckpt_020000.pth"
+$thresholds = 0.001, 0.01, 0.03, 0.05, 0.10, 0.20, 0.30, 0.40
+
+foreach ($t in $thresholds) {
+    python isar_runner.py `
+        --conf .\confs\isar_fuyan.conf `
+        --mode validate_mesh `
+        --case 1999JV6 `
+        --checkpoint $ckpt `
+        --mesh_resolution 128 `
+        --mcube_threshold $t
+
+    $tag = "{0:D4}" -f [int]($t * 1000)
+    Copy-Item .\exp\1999JV6\meshes\mesh_020000.ply ".\exp\1999JV6\meshes\mesh_020000_thr$tag.ply"
+}
+```
 
 ---
 
 ## 6. 常用配置项
 
-训练长度和保存频率：
-
 ```hocon
 train {
-    end_iter = 1000
-    save_freq = 200
-    val_freq = 20
-    val_mesh_freq = 100
-    val_sdf_freq = 20
-    metrics_plot_freq = 20
+    learning_rate = 5e-4
+    end_iter = 20000
+    image_loss_type = "mse"
 }
-```
 
-验证视角：
-
-```hocon
 validate {
-    view_ids = "all"      # all 或 0 或 0,6,12
+    mesh_resolution = 128
+    nerf_density_threshold = 0.03
+    view_ids = "all"
     final_view_ids = "all"
-}
-```
-
-验证/最终出图时的高度采样：
-
-```hocon
-validate {
     n_height = 64
 }
-```
 
-训练时高度采样调度：
-
-```hocon
-train {
-    n_height_schedule = [
-        { iter = 0, value = 16 },
-        { iter = 201, value = 32 },
-        { iter = 401, value = 64 }
-    ]
+model {
+    type = "nerf"
 }
 ```
+
+阈值经验：散点多就增大 `nerf_density_threshold`；主体缺失就减小。最终出细 mesh 时可以把 `mesh_resolution` 从 `128` 提到 `256`。

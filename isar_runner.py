@@ -160,7 +160,7 @@ class ISARRunner:
         self.export_final_sdf = self.conf.get_bool('validate.export_final_sdf', default=True)
         self.export_final_mesh = self.conf.get_bool('validate.export_final_mesh', default=False)
         self.mesh_resolution = self.conf.get_int('validate.mesh_resolution', default=64)
-        self.nerf_density_threshold = self.conf.get_float('validate.nerf_density_threshold', default=1.0)
+        self.nerf_density_threshold = self.conf.get_float('validate.nerf_density_threshold', default=0.35)
         self.final_results_saved = False
         self.checkpoint_name = checkpoint_name
         self.is_continue = is_continue or checkpoint_name is not None
@@ -200,16 +200,32 @@ class ISARRunner:
                     if fname.endswith('.pth'):
                         try:
                             iter_num = int(fname.split('_')[1].split('.')[0])
-                            if iter_num <= self.end_iter:
-                                model_list.append((iter_num, fname))
+                            if self.mode == 'train' and iter_num > self.end_iter:
+                                continue
+                            checkpoint_path = os.path.join(checkpoint_dir, fname)
+                            checkpoint_meta = torch.load(checkpoint_path, map_location='cpu')
+                            if checkpoint_meta.get('model_type', 'neus') != self.model_type:
+                                continue
+                            if self.model_type == 'nerf' and checkpoint_meta.get('nerf_density_mode') != self.nerf_network.density_mode:
+                                continue
+                            model_list.append((iter_num, fname))
                         except:
                             pass
                 if model_list:
                     model_list.sort(key=lambda x: x[0])
                     latest_model_name = model_list[-1][1]
 
+        if latest_model_name is None and self.is_continue and self.mode != 'train':
+            checkpoint_dir = os.path.join(self.base_exp_dir, 'checkpoints')
+            density_mode = getattr(self.nerf_network, 'density_mode', None)
+            raise FileNotFoundError(
+                f'No compatible checkpoint found in {checkpoint_dir} '
+                f'for model_type={self.model_type!r}, nerf_density_mode={density_mode!r}'
+            )
+
         if latest_model_name is not None:
             logging.info(f'Loading checkpoint: {latest_model_name}')
+            print(f'Loading checkpoint: {latest_model_name}')
             self.load_checkpoint(latest_model_name)
 
         self.apply_mode_n_height()
@@ -276,9 +292,13 @@ class ISARRunner:
             )
 
             pred_image = render_out['isar']
-            pred_image_norm = pred_image / (pred_image.mean() + 1e-6)
-            target_image_norm = target_image / (target_image.mean().detach() + 1e-6)
-            image_loss_raw = self.compute_image_loss(pred_image_norm, target_image_norm)
+            if self.model_type == 'nerf':
+                pred_image_for_loss = pred_image
+                target_image_for_loss = target_image
+            else:
+                pred_image_for_loss = pred_image / (pred_image.mean() + 1e-6)
+                target_image_for_loss = target_image / (target_image.mean().detach() + 1e-6)
+            image_loss_raw = self.compute_image_loss(pred_image_for_loss, target_image_for_loss)
             
             eikonal_loss_raw = render_out['gradient_error'] if self.model_type == 'neus' else torch.zeros([], device=self.device)
             image_loss = self.image_weight * image_loss_raw
@@ -419,6 +439,8 @@ class ISARRunner:
     def compute_image_loss(self, pred_image_norm, target_image_norm):
         if self.image_loss_type == 'l1':
             return F.l1_loss(pred_image_norm, target_image_norm)
+        if self.image_loss_type in ('mse', 'l2'):
+            return F.mse_loss(pred_image_norm, target_image_norm)
         if self.image_loss_type in ('huber', 'smooth_l1'):
             return F.smooth_l1_loss(
                 pred_image_norm,
@@ -429,10 +451,16 @@ class ISARRunner:
             diff = pred_image_norm - target_image_norm
             return torch.sqrt(diff * diff + self.charbonnier_eps * self.charbonnier_eps).mean()
         raise ValueError(
-            "train.image_loss_type must be one of: l1, huber, smooth_l1, charbonnier"
+            "train.image_loss_type must be one of: l1, mse, l2, huber, smooth_l1, charbonnier"
         )
 
     def update_learning_rate(self):
+        if self.model_type == 'nerf':
+            factor = 0.8 ** (self.iter_step // 1000)
+            for g in self.optimizer.param_groups:
+                g['lr'] = self.learning_rate * factor
+            return
+
         if self.iter_step < self.warm_up_end and self.warm_up_end > 0:
             factor = self.iter_step / self.warm_up_end
         else:
@@ -789,8 +817,9 @@ class ISARRunner:
                 threshold = 0.0
             elif threshold == 0.0:
                 threshold = self.nerf_density_threshold
+        threshold_label = 'threshold_ratio' if self.model_type == 'nerf' else 'threshold'
         print(f"Extracting mesh at iter {self.iter_step} "
-              f"(resolution={resolution}, threshold={threshold})...")
+              f"(resolution={resolution}, {threshold_label}={threshold})...")
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32, device=self.device)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32, device=self.device)
 
@@ -805,10 +834,13 @@ class ISARRunner:
                 resolution=resolution
             )
         else:
-            vertices, triangles = self.renderer.extract_density_geometry(
+            vertices, triangles, density_threshold, density_min, density_max = self.renderer.extract_density_geometry(
                 self.nerf_network, bound_min, bound_max,
-                resolution=resolution, threshold=threshold
+                resolution=resolution, threshold=threshold,
+                view_dirs=self.dataset.frame_meta['radar_los']
             )
+            print(f"NeRF effective density alpha*sigma relative threshold: ratio={threshold:.6g}, "
+                  f"value={density_threshold:.6g}, min={density_min:.6g}, max={density_max:.6g}")
 
         os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
         mesh_path = os.path.join(self.base_exp_dir, 'meshes',
@@ -821,7 +853,7 @@ class ISARRunner:
         logging.info(f'Mesh saved to {mesh_path}')
         print(f"Mesh saved to {mesh_path} "
               f"(vertices={len(vertices)}, triangles={len(triangles)}, "
-              f"resolution={resolution}, threshold={threshold})")
+              f"resolution={resolution}, {threshold_label}={threshold})")
 
 
 
@@ -847,6 +879,10 @@ if __name__ == '__main__':
 
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
+
+    if args.mode == 'validate_mesh' and args.checkpoint is None and not args.is_continue:
+        args.is_continue = True
+        print('validate_mesh: automatically loading latest checkpoint')
 
     runner = ISARRunner(args.conf, args.mode, args.case, args.is_continue, args.checkpoint)
     if args.mode == 'train':

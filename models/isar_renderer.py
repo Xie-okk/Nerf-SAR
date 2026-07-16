@@ -290,7 +290,9 @@ class ISARRenderer:
 
         if self.splat_mode == 3:
             image = self._apply_sinc_psf(image, frame_meta)
-        image = torch.sqrt(torch.clamp(image, min=0.0) + 1e-6) - np.sqrt(1e-6)
+        # Legacy compressed-amplitude output:
+        # image = torch.sqrt(torch.clamp(image, min=0.0) + 1e-6) - np.sqrt(1e-6)
+        image = torch.clamp(image, min=0.0)
 
         return {
             'isar': image,
@@ -319,43 +321,26 @@ class ISARRenderer:
         n_samples = range_vals.shape[0]
         points = ray_bases[:, None, :] + range_vals[None, :, None] * ray_dir[None, None, :]
         points_flat = points.reshape(-1, 3)
-        points_flat.requires_grad_(True)
-        density, intensity, field_aux = nerf_network.density_intensity(
-            points_flat,
-            use_learned_intensity=False,
-            return_aux=True
-        )
 
-        surface_sdf = field_aux.get('surface_sdf')
-        if surface_sdf is None:
-            raise RuntimeError(
-                'Incidence-angle backscatter requires NeRF density_mode=ellipsoid_sdf_residual'
-            )
-        gradients = torch.autograd.grad(
-            outputs=surface_sdf,
-            inputs=points_flat,
-            grad_outputs=torch.ones_like(surface_sdf),
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True
-        )[0]
-        normals = F.normalize(gradients, dim=-1).reshape(n_rays, n_samples, 3)
         los = _meta_vector(frame_meta, 'radar_los').to(
             device=points_flat.device,
             dtype=points_flat.dtype
         )
         los = F.normalize(los, dim=0)
-        incidence_cos = torch.clamp(
-            torch.sum(normals * los[None, None, :], dim=-1, keepdim=True),
-            min=0.0
+        los_flat = los[None, :].expand(points_flat.shape[0], -1)
+
+        density, sigma, field_aux = nerf_network.density_intensity(
+            points_flat,
+            los_flat,
+            use_learned_intensity=use_learned_intensity,
+            return_aux=True
         )
-        scatter = incidence_cos ** 2
 
         density = density.reshape(n_rays, n_samples, 1)
-        intensity = intensity.reshape(n_rays, n_samples, 1)
+        sigma = sigma.reshape(n_rays, n_samples, 1)
         dists = self.compute_range_dists(range_vals[None, :].expand(n_rays, -1))
         alpha, weights = self.compute_nerf_weights(density, dists)
-        point_weight = weights * scatter * ray_area
+        point_weight = weights * sigma * ray_area
 
         range_bin, azimuth_bin, range_coord, azimuth_coord = self.project_points(points_flat, frame_meta)
         point_weight_flat = point_weight.reshape(-1)
@@ -369,12 +354,10 @@ class ISARRenderer:
         return {
             'image': image,
             'density': density.reshape(-1, 1),
-            'intensity': intensity.reshape(-1, 1),
-            'surface_sdf': surface_sdf,
+            'intensity': sigma.reshape(-1, 1),
+            'sigma': sigma.reshape(-1, 1),
+            'scatter': sigma.reshape(-1, 1),
             'sdf_residual': field_aux.get('sdf_residual'),
-            'gradients': gradients,
-            'normals': normals.reshape(-1, 3),
-            'scatter': scatter.reshape(-1, 1),
             'points': points_flat,
             'point_weight': point_weight.reshape(-1, 1),
             'range_bin': range_bin,
@@ -384,7 +367,6 @@ class ISARRenderer:
             'alpha': alpha,
             'weights': weights,
         }
-
     def render_ray_chunk(self, ray_bases, ray_dir, coarse_range_vals, ray_area, frame_meta,
                          sdf_network, variance_network, image_shape, cos_anneal_ratio=1.0):
         height, width = image_shape
@@ -786,14 +768,59 @@ class ISARRenderer:
         kernel_4d = kernel[None, None, :, :]
         return F.conv2d(image_4d, kernel_4d, padding=(radius_r, radius_a))[0, 0]
 
-    def extract_density_geometry(self, nerf_network, bound_min, bound_max, resolution, threshold):
-        from models.renderer import extract_geometry
+    def extract_density_geometry(self, nerf_network, bound_min, bound_max, resolution, threshold, view_dirs=None):
+        from models.renderer import extract_fields, _marching_cubes
         device = next(nerf_network.parameters()).device
-        return extract_geometry(
-            bound_min, bound_max,
-            resolution=resolution, threshold=threshold,
-            query_func=lambda pts: nerf_network.density(pts.to(device))
+
+        if view_dirs is not None:
+            view_dirs = view_dirs.to(device=device, dtype=torch.float32).reshape(-1, 3)
+            view_dirs = F.normalize(view_dirs, dim=-1)
+
+        def query_effective_density(pts):
+            pts = pts.to(device)
+            if view_dirs is None or view_dirs.shape[0] == 0:
+                return nerf_network.density(pts)
+
+            alpha_sum = None
+            sigma_sum = torch.zeros([pts.shape[0], 1], device=device, dtype=pts.dtype)
+            for los in view_dirs:
+                los_batch = los[None, :].to(dtype=pts.dtype).expand(pts.shape[0], -1)
+                alpha, sigma = nerf_network.density_intensity(pts, los_batch)
+                if alpha_sum is None:
+                    alpha_sum = alpha
+                sigma_sum = sigma_sum + sigma
+            sigma_mean = sigma_sum / float(view_dirs.shape[0])
+            return alpha_sum * sigma_mean
+
+        density_grid = extract_fields(
+            bound_min,
+            bound_max,
+            resolution=resolution,
+            query_func=query_effective_density
         )
+
+        density_min = float(np.nanmin(density_grid))
+        density_max = float(np.nanmax(density_grid))
+        if not np.isfinite(density_min) or not np.isfinite(density_max):
+            raise ValueError('NeRF density grid contains non-finite values')
+        if density_max <= density_min:
+            raise ValueError(
+                'NeRF density grid has no dynamic range: '
+                f'min={density_min:.6g}, max={density_max:.6g}'
+            )
+
+        threshold_ratio = float(threshold)
+        if threshold_ratio < 0.0 or threshold_ratio > 1.0:
+            raise ValueError('NeRF density threshold ratio must be in [0, 1]')
+        threshold_value = density_min + (density_max - density_min) * threshold_ratio
+        eps = max((density_max - density_min) * 1e-6, 1e-8)
+        threshold_value = min(max(threshold_value, density_min + eps), density_max - eps)
+
+        vertices, triangles = _marching_cubes(density_grid, threshold_value)
+        b_max_np = bound_max.detach().cpu().numpy()
+        b_min_np = bound_min.detach().cpu().numpy()
+        vertices = vertices / (resolution - 1.0) * (b_max_np - b_min_np)[None, :] + b_min_np[None, :]
+        return vertices, triangles, threshold_value, density_min, density_max
 
     def extract_nerf_surface_geometry(self, nerf_network, bound_min, bound_max, resolution):
         """Extract the zero level set of the SDF-parameterized NeRF surface."""

@@ -3,8 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import logging
-import mcubes
-from icecream import ic
+try:
+    import mcubes
+except ImportError:
+    mcubes = None
+try:
+    from icecream import ic
+except ImportError:
+    def ic(*args):
+        return args[0] if len(args) == 1 else args
 
 
 def extract_fields(bound_min, bound_max, resolution, query_func):
@@ -25,9 +32,21 @@ def extract_fields(bound_min, bound_max, resolution, query_func):
     return u
 
 
+def _marching_cubes(volume, threshold):
+    if mcubes is not None:
+        return mcubes.marching_cubes(volume, threshold)
+
+    import os
+    import tempfile
+    os.environ.setdefault('SKIMAGE_DATADIR', os.path.join(tempfile.gettempdir(), 'skimage_cache'))
+    from skimage import measure
+    vertices, triangles, _, _ = measure.marching_cubes(volume, threshold)
+    return vertices, triangles
+
+
 def extract_geometry(bound_min, bound_max, resolution, threshold, query_func):
     u = extract_fields(bound_min, bound_max, resolution, query_func)
-    vertices, triangles = mcubes.marching_cubes(u, threshold)
+    vertices, triangles = _marching_cubes(u, threshold)
     b_max_np = bound_max.detach().cpu().numpy()
     b_min_np = bound_min.detach().cpu().numpy()
 

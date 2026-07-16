@@ -33,13 +33,14 @@ def generate_isar_dataset(
     output_dir,
     scale_factor=60.0,
     rotation_period=5.0 * 3600,  # 5小时转换为秒
-    radar_frequency=9.6e9,       # 默认 9.6 GHz
+    radar_frequency=9.7e9,       # 默认 9.7 GHz
     range_resolution=1.0,        # 物理距离分辨率 (米) 
     doppler_resolution=1.0,      # 多普勒分辨率 (Hz) 
     range_grid_spacing=0.5,      # 实际距离向采样网格间距 (米/像素) - 投影用
     doppler_grid_spacing=0.5,    # 实际多普勒向采样网格间距 (Hz/像素) - 投影用
     image_size=(64, 64),         # (距离向高度, 多普勒向宽度)
-    noise_snr_db=20.0
+    noise_snr_db=20.0,
+    noise_seed=None
 ):
     """
     从 STL 模型生成 ISAR 图像序列与配套的 radar_meta.json
@@ -87,6 +88,9 @@ def generate_isar_dataset(
         views.append((np.radians(az_deg), el_down, 'down'))
 
     frames_meta = []
+    generated_images = []
+    image_file_names = []
+    rng = np.random.default_rng(noise_seed)
     height, width = image_size
     
     # --- 提前计算并保存距离轴和多普勒轴坐标 (单位: 米 和 Hz) ---
@@ -207,25 +211,15 @@ def generate_isar_dataset(
         # 卷积（same 模式）
         isar_image = cv2.filter2D(isar_image, -1, kernel_2d,
                                   borderType=cv2.BORDER_CONSTANT)
-        isar_image = np.sqrt(isar_image)
+        # Legacy compressed-amplitude output:
+        # isar_image = np.sqrt(isar_image)
+        isar_image = np.clip(isar_image, 0.0, None)
         # =============================================
         # 使用分位数截断 (Percentile Clipping)
 
-        # 加噪声
-        if noise_snr_db is not None:
-            isar_image = fun_add_noise_real(noise_snr_db, isar_image.astype(np.float32))
-
-        p_high = np.percentile(isar_image, 100)  # 取 100% 分位数作为最大值参考
-        if p_high > 0:
-            img_norm = np.clip(isar_image / p_high * 255.0, 0, 255).astype(np.uint8)
-        else:
-            img_norm = np.zeros_like(isar_image, dtype=np.uint8)
-        
-        
-        
         file_name = f"{i:03d}.png"
-        img_path = os.path.join(image_dir, file_name)
-        cv2.imwrite(img_path, img_norm)
+        generated_images.append(isar_image.astype(np.float32))
+        image_file_names.append(file_name)
         
         # 记录 Metadata (此时横轴全变成了 azimuth，单位为米)
         frames_meta.append({
@@ -252,7 +246,52 @@ def generate_isar_dataset(
             "image_size": [height, width] #距离向，方位向
         })
 
-    # 4. 生成统一的 radar_meta.json
+    clean_stack = np.stack(generated_images, axis=0).astype(np.float32)
+    if noise_snr_db is not None:
+        snr = 10 ** (noise_snr_db / 10.0)
+        clean_max = float(np.max(clean_stack))
+        if clean_max > 0.0:
+            signal_mask = clean_stack > clean_max * 1e-2
+            signal_ref = float(np.mean(np.abs(clean_stack[signal_mask]))) if np.any(signal_mask) else clean_max
+            noise_std = signal_ref / np.sqrt(snr)
+            noise = noise_std * rng.standard_normal(clean_stack.shape).astype(np.float32)
+            final_stack = np.clip(clean_stack + noise, 0.0, None)
+            print(f"Added uniform thermal noise: snr_db={noise_snr_db}, noise_std={noise_std:.6g}")
+        else:
+            final_stack = clean_stack
+            print('Skip thermal noise: clean image stack has non-positive maximum')
+    else:
+        final_stack = clean_stack
+
+    global_scale = float(np.percentile(final_stack, 99.9))
+    if not np.isfinite(global_scale) or global_scale <= 0.0:
+        global_scale = float(np.max(final_stack))
+    print(f"Normalize saved images by global 99.9 percentile: {global_scale:.6g}")
+
+    overview_tiles = []
+    for file_name, isar_image in zip(image_file_names, final_stack):
+        if global_scale > 0.0:
+            img_norm = np.clip(isar_image / global_scale * 255.0, 0, 255).astype(np.uint8)
+        else:
+            img_norm = np.zeros_like(isar_image, dtype=np.uint8)
+        overview_tiles.append(img_norm)
+        img_path = os.path.join(image_dir, file_name)
+        cv2.imwrite(img_path, img_norm)
+
+    overview_path = os.path.join(output_dir, 'isar_overview_2x9.png')
+    if overview_tiles:
+        overview_rows = 2
+        overview_cols = 9
+        tile_shape = overview_tiles[0].shape
+        blank_tile = np.zeros(tile_shape, dtype=np.uint8)
+        padded_tiles = overview_tiles[:overview_rows * overview_cols]
+        padded_tiles += [blank_tile] * (overview_rows * overview_cols - len(padded_tiles))
+        overview = np.vstack([
+            np.hstack(padded_tiles[row * overview_cols:(row + 1) * overview_cols])
+            for row in range(overview_rows)
+        ])
+        cv2.imwrite(overview_path, overview)
+    # 4. Write radar_meta.json
     meta_dict = {
         "frames": frames_meta
     }
@@ -263,6 +302,7 @@ def generate_isar_dataset(
         
     print(f"Dataset generated successfully at: {output_dir}")
     print(f"- 18 Images saved to {image_dir}")
+    print(f"- Overview image saved to {overview_path}")
     print(f"- Metadata saved to {meta_path}")
 
 if __name__ == "__main__":
@@ -275,7 +315,7 @@ if __name__ == "__main__":
     
     # 1. 定义已知物理常量
     c = 299792458.0
-    radar_freq = 9.6e9
+    radar_freq = 9.7e9
     wavelength = c / radar_freq
     rot_period = 5.0 * 3600
     omega = 2.0 * np.pi / rot_period
@@ -308,7 +348,8 @@ if __name__ == "__main__":
             range_grid_spacing=1,         
             doppler_grid_spacing=calc_doppler_spacing,   # <--- 直接传入计算好的公式变量
             image_size=(64, 64),
-            noise_snr_db=None                            # None代表不加噪声
+            noise_snr_db=None,                           # None代表不加噪声；数值表示统一热噪声目标 SNR(dB)
+            noise_seed=20260708
         )
     else:
         print(f"❌ 找不到文件: '{INPUT_STL}'")

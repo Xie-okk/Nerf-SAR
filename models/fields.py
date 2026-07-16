@@ -246,119 +246,80 @@ class RenderingNetwork(nn.Module):
 
 
 class ISARNeRFNetwork(nn.Module):
-    """Position-encoded NeRF field with density and one ISAR intensity channel."""
+    """NeRF field matching the legacy ISAR script: xyz+LOS -> alpha+sigma."""
     def __init__(self,
                  D=8,
                  W=256,
                  d_in=3,
-                 multires=0,
+                 multires=10,
+                 multires_view=4,
                  skips=(4,),
-                 density_mode='mlp',
-                 ellipsoid_radius=None,
-                 ellipsoid_center=(0.0, 0.0, 0.0),
-                 prior_density=0.5,
-                 surface_width=0.05,
-                 sdf_residual_scale=0.1,
-                 intensity_min=0.1):
+                 use_viewdirs=True,
+                 density_mode='learned_alpha_sigma'):
         super().__init__()
-        self.density_mode = str(density_mode)
-        if self.density_mode not in ('mlp', 'ellipsoid_sdf_residual'):
-            raise ValueError("density_mode must be 'mlp' or 'ellipsoid_sdf_residual'")
-        self.use_ellipsoid_surface = self.density_mode == 'ellipsoid_sdf_residual'
-
-        if self.use_ellipsoid_surface:
-            if d_in != 3:
-                raise ValueError('ellipsoid_sdf_residual mode requires d_in == 3')
-            if ellipsoid_radius is None:
-                raise ValueError('ellipsoid_radius is required for ellipsoid_sdf_residual mode')
-            ellipsoid_radius = torch.tensor(ellipsoid_radius, dtype=torch.float32)
-            ellipsoid_center = torch.tensor(ellipsoid_center, dtype=torch.float32)
-            if ellipsoid_radius.numel() != 3 or ellipsoid_center.numel() != 3:
-                raise ValueError('ellipsoid_radius and ellipsoid_center must contain exactly 3 values')
-            if torch.any(ellipsoid_radius <= 0):
-                raise ValueError('ellipsoid_radius values must be positive')
-            if prior_density <= 0 or surface_width <= 0:
-                raise ValueError('prior_density and surface_width must be positive')
-
-            self.register_buffer('ellipsoid_radius', ellipsoid_radius)
-            self.register_buffer('ellipsoid_center', ellipsoid_center)
-            self.prior_density = float(prior_density)
-            self.surface_width = float(surface_width)
-            self.sdf_residual_scale = float(sdf_residual_scale)
-            if self.sdf_residual_scale <= 0:
-                raise ValueError('sdf_residual_scale must be positive')
-
-        self.intensity_min = float(intensity_min)
-        if not 0.0 <= self.intensity_min < 1.0:
-            raise ValueError('intensity_min must be in [0, 1)')
-
-        self.embed_fn = None
-        input_ch = d_in
-        if multires > 0:
-            self.embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
-
+        self.d_in = int(d_in)
+        self.multires = int(multires)
+        self.multires_view = int(multires_view)
         self.skips = set(skips)
+        self.use_viewdirs = bool(use_viewdirs)
+        self.density_mode = 'learned_alpha_sigma'
+        self.requested_density_mode = str(density_mode)
+        self.use_ellipsoid_surface = False
+
+        input_ch = self.d_in * (1 + 2 * self.multires)
+        input_ch_views = self.d_in * (1 + 2 * self.multires_view)
+        self.input_ch = input_ch
+        self.input_ch_views = input_ch_views
+
         self.pts_linears = nn.ModuleList(
             [nn.Linear(input_ch, W)] + [
-                nn.Linear(W + input_ch, W) if layer in self.skips else nn.Linear(W, W)
-                for layer in range(1, D)
+                nn.Linear(W + input_ch, W) if i in self.skips else nn.Linear(W, W)
+                for i in range(D - 1)
             ]
         )
-        self.density_linear = nn.Linear(W, 1)
-        self.intensity_linear = nn.Linear(W, 1)
-        if self.use_ellipsoid_surface:
-            nn.init.zeros_(self.density_linear.weight)
-            nn.init.zeros_(self.density_linear.bias)
+        self.views_linears = nn.ModuleList([nn.Linear(input_ch_views + W, W // 2)])
+        self.feature_linear = nn.Linear(W, W)
+        self.alpha_linear = nn.Linear(W, 1)
+        self.sigma_linear = nn.Linear(W // 2, 1)
+        self.relu = nn.ReLU()
 
-    def forward(self, points):
-        embedded_points = self.embed_fn(points) if self.embed_fn is not None else points
-        hidden = embedded_points
+    def _position_code(self, values, multires, periodic_scale=1.0):
+        if multires <= 0:
+            return values
+        freq_bands = 2.0 ** torch.arange(
+            0, multires, dtype=values.dtype, device=values.device
+        )
+        scaled = values[..., None, :] * (periodic_scale * freq_bands[:, None])
+        encoded = torch.cat([torch.sin(scaled), torch.cos(scaled)], dim=-2)
+        return torch.cat([values, encoded.reshape(*values.shape[:-1], -1)], dim=-1)
+
+    def forward(self, points, view_dirs):
+        input_pts = self._position_code(points, self.multires, periodic_scale=math.pi)
+        input_views = self._position_code(view_dirs, self.multires_view, periodic_scale=1.0)
+
+        hidden = input_pts
         for layer, linear in enumerate(self.pts_linears):
+            hidden = self.relu(linear(hidden))
             if layer in self.skips:
-                hidden = torch.cat([embedded_points, hidden], dim=-1)
-            hidden = F.relu(linear(hidden))
-        return self.density_linear(hidden), self.intensity_linear(hidden)
+                hidden = torch.cat([input_pts, hidden], dim=-1)
 
-    def ellipsoid_sdf(self, points):
-        radius = self.ellipsoid_radius.to(device=points.device, dtype=points.dtype)
-        center = self.ellipsoid_center.to(device=points.device, dtype=points.dtype)
-        shifted_points = points[:, :3] - center[None, :]
-        k0 = torch.linalg.norm(shifted_points / radius[None, :], dim=-1, keepdim=True)
-        k1 = torch.linalg.norm(shifted_points / (radius[None, :] ** 2), dim=-1, keepdim=True)
-        sdf = k0 * (k0 - 1.0) / k1.clamp_min(1e-6)
-        center_sdf = -torch.min(radius).expand_as(sdf)
-        return torch.where(k1 > 1e-6, sdf, center_sdf)
+        alpha = self.relu(self.alpha_linear(hidden))
+        feature = self.feature_linear(hidden)
+        hidden = torch.cat([feature, input_views], dim=-1)
+        for linear in self.views_linears:
+            hidden = self.relu(linear(hidden))
+        sigma = self.relu(self.sigma_linear(hidden))
+        return alpha, sigma
 
-    def density_intensity(self, points, use_learned_intensity=True, return_aux=False):
-        raw_density, raw_intensity = self(points)
-        aux = {}
-        if not self.use_ellipsoid_surface:
-            density = F.softplus(raw_density)
-        else:
-            sdf_residual = self.sdf_residual_scale * raw_density
-            surface_sdf = self.ellipsoid_sdf(points) + sdf_residual
-            density = self.prior_density * torch.exp(-(surface_sdf / self.surface_width) ** 2)
-            aux = {
-                'surface_sdf': surface_sdf,
-                'sdf_residual': sdf_residual,
-            }
-        if use_learned_intensity:
-            intensity = self.intensity_min + (1.0 - self.intensity_min) * torch.sigmoid(raw_intensity)
-        else:
-            intensity = torch.ones_like(raw_intensity)
+    def density_intensity(self, points, view_dirs, use_learned_intensity=True, return_aux=False):
+        alpha, sigma = self(points, view_dirs)
         if return_aux:
-            return density, intensity, aux
-        return density, intensity
-
-    def surface_sdf(self, points):
-        if not self.use_ellipsoid_surface:
-            raise RuntimeError('surface_sdf is only available in ellipsoid_sdf_residual mode')
-        raw_density, _ = self(points)
-        return self.ellipsoid_sdf(points) + self.sdf_residual_scale * raw_density
+            return alpha, sigma, {}
+        return alpha, sigma
 
     def density(self, points):
-        return self.density_intensity(points)[0]
-
+        zeros_los = torch.zeros_like(points)
+        return self(points, zeros_los)[0]
 
 class SingleVarianceNetwork(nn.Module):
     """
